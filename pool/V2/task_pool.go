@@ -1,4 +1,4 @@
-package pool
+package V2
 
 import (
 	"context"
@@ -11,15 +11,13 @@ import (
 	自己封装的线程池
 */
 
-// 池子要执行的业务函数（创建时绑定，全局唯一）
-type Handler[TArg, TResult any] func(ctx context.Context, arg TArg) (TResult, error)
+// 定义任务
+type Task func(ctx context.Context)
 
 // 定义协程池对象
-type WorkerPool[TArg, TResult any] struct {
-	//绑定的handler
-	handler Handler[TArg, TResult]
-	// 队列里放「参数 + 结果通道」
-	tasks chan *job[TArg, TResult]
+type WorkerPool struct {
+	//任务列表
+	tasks chan func(ctx context.Context)
 	//任务等待
 	wg     sync.WaitGroup
 	taskWg sync.WaitGroup
@@ -31,21 +29,11 @@ type WorkerPool[TArg, TResult any] struct {
 	cancel context.CancelFunc
 }
 
-type job[TArg, TResult any] struct {
-	arg    TArg
-	result chan resultPair[TResult]
-}
-
-func NewWorkerPool[TArg, TResult any](
-	parent context.Context,
-	workerNum int,
-	handler Handler[TArg, TResult],
-) *WorkerPool[TArg, TResult] {
+func NewWorkerPool(parent context.Context, workerNum int) *WorkerPool {
 	ctx, cancel := context.WithCancel(parent)
-	return &WorkerPool[TArg, TResult]{
-		handler: handler,
+	return &WorkerPool{
 		//给 channel 加缓冲（1024），避免 Submit 阻塞调用方
-		tasks:     make(chan *job[TArg, TResult], 1024),
+		tasks:     make(chan func(ctx context.Context), 1024),
 		workerNum: workerNum,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -55,7 +43,7 @@ func NewWorkerPool[TArg, TResult any](
 // worker
 // 增加了取消
 // 增加了捕获错误
-func (p *WorkerPool[TArg, TResult]) worker(id int) {
+func (p *WorkerPool) worker(id int) {
 	for {
 		select {
 		case <-p.ctx.Done(): //收到取消信号
@@ -68,43 +56,36 @@ func (p *WorkerPool[TArg, TResult]) worker(id int) {
 				return
 			}
 
-			p.runJob(task)
+			p.runTask(task)
 		}
 	}
 }
 
 // 运行任务+捕获错误
-func (p *WorkerPool[TArg, TResult]) runJob(j *job[TArg, TResult]) {
+func (p *WorkerPool) runTask(task Task) {
 	defer p.taskWg.Done()
 
-	var pair resultPair[TResult]
 	//捕获错误
 	defer func() {
 		if err := recover(); err != nil {
-			pair.err = fmt.Errorf("task panic:%v", err)
+			fmt.Println("worker panic:", err)
 		}
-		j.result <- pair
-		// 必须 close，否则 Result() 阻塞
-		close(j.result)
 	}()
 
-	pair.val, pair.err = p.handler(p.ctx, j.arg)
+	task(p.ctx)
 }
 
 // worker 退出前清空队列
-func (p *WorkerPool[TArg, TResult]) drainTasks() {
+func (p *WorkerPool) drainTasks() {
 	for {
 		select {
-		case j, ok := <-p.tasks:
+		case task, ok := <-p.tasks:
 			if !ok {
 				return
 			}
 			//池子已关闭，不再执行，把计数减掉
 			p.taskWg.Done()
-			j.result <- resultPair[TResult]{
-				err: errors.New("worker pool closed"),
-			}
-			close(j.result)
+			_ = task //不执行
 		default:
 			return //队列空了
 		}
@@ -112,7 +93,7 @@ func (p *WorkerPool[TArg, TResult]) drainTasks() {
 }
 
 // 启动worker
-func (p *WorkerPool[TArg, TResult]) Start() {
+func (p *WorkerPool) Start() {
 	for i := 0; i < p.workerNum; i++ {
 		//val:=i
 		p.wg.Add(1)
@@ -124,12 +105,12 @@ func (p *WorkerPool[TArg, TResult]) Start() {
 }
 
 // 提交任务
-func (p *WorkerPool[TArg, TResult]) Submit(arg TArg) (*Future[TResult], error) {
+func (p *WorkerPool) Submit(task func(ctx context.Context)) error {
 	// 1. 池子关了就不接任务
 	select {
 	case <-p.ctx.Done():
 		// 线程池已关闭
-		return nil, errors.New("worker pool closed")
+		return errors.New("worker pool closed")
 	default:
 	}
 
@@ -137,27 +118,19 @@ func (p *WorkerPool[TArg, TResult]) Submit(arg TArg) (*Future[TResult], error) {
 	p.taskWg.Add(1)
 
 	// 3.再入队；入队失败要回滚
-	j := &job[TArg, TResult]{
-		arg:    arg,
-		result: make(chan resultPair[TResult], 1),
-	}
-
 	select {
-	case p.tasks <- j:
-		return &Future[TResult]{
-			ch: j.result,
-		}, nil
+	case p.tasks <- task:
+		return nil
 	case <-p.ctx.Done():
 		// 线程池已关闭
 
 		p.taskWg.Done() //回滚，否则 Shutdown 死锁
-		close(j.result)
-		return nil, errors.New("worker pool closed")
+		return errors.New("worker pool closed")
 	}
 }
 
 // 优雅关闭
-func (p *WorkerPool[TArg, TResult]) Shutdown() {
+func (p *WorkerPool) Shutdown() {
 	// 1. 不再接任务（Submit 要检测 closed）
 	close(p.tasks)
 	// 2. 等已取出的任务跑完

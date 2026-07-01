@@ -34,7 +34,7 @@ func main() {
 		//close(pools)
 		//fmt.Println("all done")
 	}
-
+	//V1版本
 	{
 		//pools := V1.NewWorkerPool(3)
 		//pools.Start()
@@ -50,29 +50,69 @@ func main() {
 		//pools.Shutdown()
 		//fmt.Println("pools V1 shutdown")
 	}
-
+	//V2版本
 	{
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5) //设置2秒超时
+		//ctx, cancel := context.WithTimeout(context.Background(), time.Second*2) //设置2秒超时
+		//defer cancel()
+		//
+		//pools := V2.NewWorkerPool(ctx, 3)
+		//pools.Start()
+		//
+		//for i := 0; i < 10; i++ {
+		//	id := i
+		//	err := pools.Submit(func(ctx context.Context) {
+		//		select {
+		//		case <-ctx.Done():
+		//			fmt.Println("task", id, "已取消")
+		//		case <-time.After(time.Second):
+		//			fmt.Println("task", id, "完成")
+		//		}
+		//	})
+		//	if err != nil {
+		//		fmt.Println("Submit failed", id, err)
+		//	}
+		//}
+		//
+		//pools.Shutdown()
+	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2) //设置2秒超时
 		defer cancel()
 
-		pools := pool.NewWorkerPool(ctx, 3)
-		pools.Start()
-
-		for i := 0; i < 10; i++ {
-			id := i
-			err := pools.Submit(func(ctx context.Context) {
-				select {
-				case <-ctx.Done():
-					fmt.Println("task", id, "已取消")
-				case <-time.After(time.Second):
-					fmt.Println("task", id, "完成")
-				}
-			})
-			if err != nil {
-				fmt.Println("Submit failed", id, err)
+		//定义handler
+		handler := func(ctx context.Context, id int) (string, error) {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(time.Second):
+				return fmt.Sprintf("task %d 完成", id), nil
 			}
 		}
 
-		pools.Shutdown()
+		//创建池子
+		p := pool.NewWorkerPool(ctx, 3, handler)
+		p.Start()
+
+		//提交：只带参数
+		for i := 0; i < 10; i++ {
+			f, err := p.Submit(i)
+			if err != nil {
+				fmt.Println("submit faild:", i, err)
+				continue
+			}
+
+			go func() {
+				msg, err := f.Result(context.Background())
+				if err != nil {
+					fmt.Println("task", i, "err:", err)
+					return
+				}
+				fmt.Println(msg)
+			}()
+		}
+
+		//等池子跑完
+		p.Shutdown()
+
 	}
 }
